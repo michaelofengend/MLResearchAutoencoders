@@ -1,0 +1,287 @@
+import numpy  as np
+import matplotlib.pyplot as plt
+from matplotlib.cm import get_cmap
+import os, sys, time
+import collections
+from skimage import io
+from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
+from skimage.exposure import equalize_hist, rescale_intensity
+from scipy.signal import medfilt
+import pandas as pd
+
+# This is a small network so disable the GPU.
+# os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
+# Choose a backend.  Plaidml lets us use a GPU on Mac OS X.  Tensorflow on other systems usually.
+Backend='plaidml'
+# Backend='tensorflow'
+
+if Backend == 'plaidml':
+    os.environ["KERAS_BACKEND"] = "plaidml.keras.backend"
+    from keras.layers import Dense, Dropout, Activation, InputLayer, Input
+    from keras.models import Sequential, Model
+
+if Backend == 'tensorflow':
+    # Now using TF 2.0
+    from tensorflow.python.keras.layers import Dense, Dropout, Activation, InputLayer, Input, Conv2D, Conv1D
+    from tensorflow.python.keras.models import Sequential, Model
+    from tensorflow.python.keras.callbacks import TensorBoard, EarlyStopping
+    if not os.path.exists('TFLogs'):
+        os.mkdir('TFLogs')
+
+# OutputDir = 'SimpleAutoencoderOutput'
+# if not os.path.exists(OutputDir):
+#     os.mkdir(OutputDir)
+
+def PrintPlot(Name='dummy'):
+    plt.savefig(os.path.join(OutputDir, Name), dpi=300)
+    # os.system('/Users/Zack/.iterm2/imgcat AutoencoderOnGaussian_Inputdata.png')
+
+print ('------------------------------ START ------------------------------')
+StartTime = time.time()
+
+# These are all some example and practical data inputs.
+# Comment them all out except the one you wish to use.
+# Each of them should produce the following variables for use by thet code below:
+# x = np.array(m,n) for m training samples with n dimensions on input.
+# labels = list(m) optional numbering for clusters in the input data.  For example if it was previously predicted by kmeans, etc.
+# HiddenLayerScaling = int.  How fat to make each hidden layer.  1 means the hidden layers have the same size as the input dimension.
+# NumHiddenLayers = int, how many dense layers to have.  (Encoder and decoder will each have NumHiddenLayers.)
+# NumEpochs = int, how many epochs for training.
+# alpha = 0-1 float.  Alpha for the output plot.  If you have a lot of samples use a small alpha.
+# InputBasisAxisNames = [str,str,...] optional list of names of the input axes.
+# XY = np.array(M,2) optional.  If it exists then it has a shape of Mx2 (M samples in the training set).  We will build an image of the latent space from these coordinates.  There must also be InputImageDimension = a shape of the input image.  (np.array([x,y]))
+
+
+# Load a set of maps and do pixel by pixel analysis.
+ElementList = ['Mg', 'Al', 'Si', 'S', 'K', 'Ca', 'Fe', 'C', 'O']
+InputBasisAxisNames = ElementList
+ElementMaps = []
+medkern=3
+# Each image is an element.
+for El in ElementList:
+    ElementMaps.append(io.imread(El + '_Ka.tif'))
+    ElementMaps[-1] = medfilt(ElementMaps[-1], kernel_size=(medkern, medkern))
+# Remember XY coordinates for each pixel.  We will want to reconstruct the latent space image later.
+X,Y = np.meshgrid(range(ElementMaps[0].shape[1]), range(ElementMaps[0].shape[0]))
+ElementMaps.append(X)
+ElementMaps.append(Y)
+Cube = np.array(ElementMaps)
+# Turn this into an MxN shape for training.  (M samples, N variables).
+x = Cube.reshape(len(ElementMaps),-1).T
+# Cut off the XY variables.  We want to remember them but not train on them.
+XY = x[:,-2:]
+x = x[:, :-2]
+InputImageShape = ElementMaps[0].shape # Remember the shape of the input images so we can reconstruct a latent image of the same dimension.
+# Scale the data so the net can do a good job.
+scaler = MinMaxScaler()
+scaler.fit(x)
+x = scaler.transform(x)
+# We can randomly sample the data for short training while debugging or quick training.
+randpoints = np.random.randint(low=0, high=x.shape[0], size=x.shape[0]//10)
+# equalize_hist = lambda x: x
+# x = x[randpoints,:]; XY = XY[randpoints,:]  # Note, if you only include part of the data, we have to turn off equalize_hist.
+print(x.shape)
+labels = np.ones(x.shape[0])
+print(f'Shape of input data: {x.shape}')
+# Finally configure the network.
+HiddenLayerScaling = 6
+NumHiddenLayers = 3 
+NumEpochs = 20
+OutputDir = f'SimpleEDSAutoencoder_Scaling_{HiddenLayerScaling}-Hidden_{NumHiddenLayers}-Epochs_{NumEpochs}'
+alpha=0.05
+if not os.path.exists(OutputDir):
+    os.mkdir(OutputDir)
+
+# Visualize the input data.
+plt.scatter(x[:,0], x[:,1], c=labels, alpha=alpha, edgecolors='none')
+plt.gca().set_aspect('equal')
+PrintPlot('InputData')
+
+# # Sometimes it is useful to also analyze the input data via other approaches.  So output a CSV with the input data.
+if 'InputBasisAxisNames' in locals():
+    dfInput = pd.DataFrame(x, columns=InputBasisAxisNames)
+else:
+    dfInput = pd.DataFrame(x, columns=[str(h) for h in range(x.shape[1])])
+# If there is label data, add a column for it.
+if 'labels' in locals():
+    dfInput['labels'] = labels
+# If there is XY coordinate data (it came from an image) add a column for it.
+if 'XY' in locals():
+    dfInput['x'] = XY[:,0]
+    dfInput['y'] = XY[:,1]
+dfInput.to_csv(os.path.join(OutputDir, 'InputData.csv'), index=False)
+# np.savetxt(os.path.join(OutputDir, 'InputData.csv'), x, delimiter=',', header=','.join([str(h) for h in range(x.shape[1])]))
+# if 'InputBasisAxisNames' in locals():
+#     np.savetxt(os.path.join(OutputDir, 'InputData.csv'), x, delimiter=',', header=','.join(InputBasisAxisNames))
+# else:
+#     np.savetxt(os.path.join(OutputDir, 'InputData.csv'), x, delimiter=',', header=','.join([str(h) for h in range(x.shape[1])]))
+
+# One function to make the network
+def DoOneAutoNN(Data, midlayersize=8, numhiddenlayers=1, outputsize=2, epochs=5000):
+    np.random.seed(1)
+    dropout = 0.15
+    
+    # Create the autoencoder network.  There are two halves: the encoder and decoder.
+
+    # The encoder takes the input data and converts it to the latent space (reduced dimension).
+    # The input shape is determined from the input data.
+    EncoderInput = Input(shape=(Data.shape[1],), name='EncoderInput')
+    x = EncoderInput
+    # We have a configurable number of hidden layers, with some dropout and activations.
+    for i in range(numhiddenlayers):
+        x = Dense(midlayersize, activation='relu', name=f'EncoderHidden{i}')(x)
+        x = Dropout(dropout, name=f'EncoderDropout{i}')(x)
+
+    # This is the latent layer, or the "output" of the autoencoder.
+    LatentLayer = Dense(outputsize, name='LatentLayer')(x)
+ 
+    # Now we have a decoder that tries to reconstruct the inputs from the latent layer.
+    DecoderInput = Input(shape=(outputsize,))
+    x = Dense(outputsize, activation='relu')(DecoderInput)
+    # x = LatentLayer
+    # The hidden layers in the decoder are supposed to be symmetric w.r.t. the encoder.
+    for i in range(numhiddenlayers):
+        x = Dense(midlayersize, activation='relu', name=f'DecoderHidden{i}')(x)
+        x = Dropout(dropout, name=f'DecoderDropout{i}')(x)
+    # The final layer must be symmetric to the input and produce output like the input.
+    DecoderOutput = Dense(Data.shape[1], activation='relu', name='DecoderOutput')(x) # output layer
+
+    # Now we have to construct a model for each of the encoder, decoder, and both chained.
+    EncoderModel = Model(inputs=EncoderInput, outputs=LatentLayer)
+    EncoderModel.summary()
+    DecoderModel = Model(inputs=DecoderInput, outputs=DecoderOutput)
+    DecoderModel.summary()
+    AutoEncoderModel = Model(inputs=EncoderInput, outputs=DecoderModel(EncoderModel(EncoderInput)))
+    AutoEncoderModel.summary()
+
+    AutoEncoderModel.compile(optimizer='adam', loss='mean_squared_error', metrics=['accuracy'])
+    
+    # Fit the data.
+    if Backend == 'tensorflow':
+        history = AutoEncoderModel.fit(Data, Data, batch_size=Data.shape[0], epochs=epochs, verbose=1, callbacks=[
+                            TensorBoard(log_dir='TFLogs', write_graph=True, write_images=True)])
+    else:
+        history = AutoEncoderModel.fit(Data, Data, batch_size=Data.shape[0], epochs=epochs, verbose=1)
+        history.history['accuracy'] = history.history['acc'] # Keras uses a shorthand name for accuracy.  But we want to output the same name regardless of backend.
+    AutoEncoderModel.evaluate(Data,Data)
+
+    return history, AutoEncoderModel, EncoderModel, DecoderModel
+
+history, AutoEncoderModel, EncoderModel, DecoderModel = DoOneAutoNN(x, midlayersize=HiddenLayerScaling*x.shape[1], numhiddenlayers=NumHiddenLayers, epochs=NumEpochs, outputsize=3)
+plt.figure()
+plt.plot(history.history['accuracy'])
+plt.ylabel('Accuracy')
+plt.xlabel('Epoch')
+PrintPlot('NNacc')
+print(f'Final accuracy is approx: {np.mean(history.history["accuracy"][-100:])}')
+
+# Show the basis coordinates of the encoded space in the reference of the input space.
+Dec = DecoderModel.predict(np.array([[0,0,0], [1,0,0], [0,1,0], [0,0,1]]))
+# plt.figure()
+# plt.scatter(Enc[:,0], Enc[:,1], c=labels, alpha=alpha)
+# PrintPlot('EncodedProjection')
+# np.savetxt(os.path.join(OutputDir, 'EncodedOutput.txt'), Enc)
+
+# Sometimes it is useful to see how the basis translates to first order.  Nets are non-linear so this is not always a clear way to translate.
+Origin = np.zeros(x.shape[1])[np.newaxis, :]
+Basis = np.concatenate((Origin, np.eye(x.shape[1])), axis=0)
+EncBasis = EncoderModel.predict(Basis)
+EncodedBasisString = ''
+EncodedBasisString += 'Translation from orthogonal input basis vectors to the encoded space.\n'
+for i in range(Basis.shape[0]):
+    EncodedBasisString += f'{Basis[i,:]} -> {EncBasis[i,:]}\n'
+print(EncodedBasisString)
+with open(os.path.join(OutputDir, 'EncodedOutputBasis.txt'), 'w') as f:
+    f.write(EncodedBasisString)
+
+# Show the encoded projection of the data, and include arrows to show how the basis vectors of the input space look in the latent space.
+Enc = EncoderModel.predict(x)
+plt.figure()
+plt.scatter(Enc[:,0], Enc[:,1], c=labels, alpha=alpha, edgecolors='none')
+PrintPlot('EncodedProjection')
+
+# We will do arrows in a number of steps from the origin to 2.  This will show if the projected basis vectors are curved.
+LastEncBasis = np.tile(Origin, (EncBasis.shape[0], 1)) # Make a set of vectors which are an origin for each arrow.
+LastEncBasis = EncoderModel.predict(LastEncBasis)
+# We will need some colors for the lines.
+colors = get_cmap('Set3').colors
+# Draw line segments for each arrow...
+for step in np.linspace(0,1,20):
+    # Calculate the position of the ends of the next line segments.
+    EncBasis = EncoderModel.predict(Basis*step)
+    for i in range(1, EncBasis.shape[0]):
+        plt.plot([LastEncBasis[i,0], EncBasis[i,0]], [LastEncBasis[i,1], EncBasis[i,1]], c=colors[i%len(colors)], alpha=1)
+    LastEncBasis = EncBasis
+# Print labels for the basis vectors.
+import matplotlib.patheffects as PathEffects
+for i in range(1,EncBasis.shape[0]):
+    # If the user also defined names for the input basis, then we can print those as well.
+    if 'InputBasisAxisNames' in locals():
+        VectorName = InputBasisAxisNames[i-1]
+    else:
+        VectorName = str(i)
+    txt = plt.text(LastEncBasis[i,0], LastEncBasis[i,1], VectorName, c=colors[i%len(colors)], alpha=0.75)
+    txt.set_path_effects([PathEffects.withStroke(linewidth=2, foreground='w')])
+
+PrintPlot('EncodedProjectionWithBasis')
+np.savetxt(os.path.join(OutputDir, 'EncodedOutput.txt'), Enc)
+
+# Histograms of latent variables.
+fig,ax = plt.subplots(3,1)
+for i in range(3):
+    ax[i].hist(Enc[:,i])
+    ax[i].set_xlabel(f'Latent axis {i}')
+PrintPlot('EncodedProjectionHistograms')
+
+# If the user provides an XY variable with shape Mx2 (M samples in the training set) then we can use the X,Y coordinates to reconstruct an image of the latent space. 
+if 'XY' in locals():
+    LatentImageShape = list(InputImageShape) # x,y dimensions of the latent image will be the same as the input
+    LatentImageShape.append(3) # But it will have three channels (RGB)
+    LatentImage = np.zeros(LatentImageShape)
+    for i, (y, x) in enumerate(XY): # Remember to swap x and y ... stupid matplotlib...
+        LatentImage[int(x), int(y), 0] = Enc[i,0]
+        LatentImage[int(x), int(y), 1] = Enc[i,1]
+        LatentImage[int(x), int(y), 2] = Enc[i,2]
+    plt.figure()
+    plt.imshow(LatentImage[:,:,0])
+    plt.colorbar()
+    plt.title('Latent image colored by dimension 1 value.')
+    PrintPlot('LatentImageAxis1')
+    plt.figure()
+    plt.imshow(LatentImage[:,:,1])
+    plt.colorbar()
+    plt.title('Latent image colored by dimension 2 value.')
+    PrintPlot('LatentImageAxis2')
+    plt.figure()
+    plt.imshow(LatentImage[:,:,2])
+    plt.colorbar()
+    plt.title('Latent image colored by dimension 2 value.')
+    PrintPlot('LatentImageAxis3')
+    plt.figure()
+    def NormImage(img):
+        img -= np.min(img)
+        img = img / np.max(img)
+        img *= 255
+        return img
+    def ColorHistImage(img):
+        img = NormImage(img)
+        if np.mean(img) > 255/2:
+            print('Flipping channel')
+            img *= -1
+            img = NormImage(img)
+        img = equalize_hist(img)
+        img = rescale_intensity(img)*255
+        return img
+    for i in range(3):
+        print(f'Scale channel {i}')
+        LatentImage[:,:,i] = ColorHistImage(LatentImage[:,:,i])
+    LatentImage = LatentImage.astype('uint8')
+    plt.imshow(LatentImage)
+    plt.title('Latent image in color')
+    PrintPlot('LatentImageColor')
+    io.imsave(os.path.join(OutputDir, 'LatentImage.tif'), LatentImage)
+    
+
+print(f'Total running time = {time.time() - StartTime:0.2f} seconds.')
+print ('------------------------------ DONE ------------------------------')
